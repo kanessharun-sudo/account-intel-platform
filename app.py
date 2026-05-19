@@ -74,9 +74,10 @@ with st.sidebar:
         "Concurrent leads",
         min_value=1,
         max_value=10,
-        value=4,
+        value=3,
         help="How many leads to process in parallel. Higher = faster but "
-        "more rate-limit risk.",
+        "more rate-limit risk. 2-3 is the sweet spot for most Anthropic "
+        "API tiers.",
     )
 
     st.divider()
@@ -184,8 +185,9 @@ def _run_in_thread(
     asyncio.set_event_loop(loop)
     client = AsyncAnthropic()  # picks up ANTHROPIC_API_KEY from env
 
-    def _cb(done, total, latest: EnrichmentResult):
-        result_queue.put(("progress", done, total, latest))
+    def _cb(event, count, total, payload):
+        # event is 'started' or 'completed'; payload is a Lead or EnrichmentResult
+        result_queue.put((event, count, total, payload))
 
     try:
         results = loop.run_until_complete(
@@ -223,9 +225,19 @@ if run_clicked:
     )
     thread.start()
 
-    progress = st.progress(0.0, text="Starting enrichment...")
+    progress = st.progress(0.0, text="Starting enrichment — first results in ~15-30s...")
     live_results: list[EnrichmentResult] = []
     total = len(st.session_state.leads)
+    in_flight: list[str] = []  # names of leads currently being researched
+    completed_count = 0
+
+    def _render_progress_text() -> str:
+        """Build a status string showing what's in flight and how many are done."""
+        if in_flight:
+            shown = ", ".join(in_flight[:3])
+            more = f" (+{len(in_flight) - 3} more)" if len(in_flight) > 3 else ""
+            return f"Researching: {shown}{more} · {completed_count}/{total} done"
+        return f"{completed_count}/{total} done"
 
     # Poll the queue while the thread runs
     while True:
@@ -233,18 +245,27 @@ if run_clicked:
             msg = queue.get(timeout=0.5)
         except Empty:
             if not thread.is_alive():
-                # Thread died without sending a 'done' or 'error' — shouldn't
-                # happen, but break to avoid hang.
                 break
             continue
 
         kind = msg[0]
-        if kind == "progress":
+        if kind == "started":
+            _, _started_count, total_, lead = msg
+            in_flight.append(lead.name)
+            progress.progress(
+                completed_count / total_,
+                text=_render_progress_text(),
+            )
+        elif kind == "completed":
             _, done, total_, latest = msg
+            completed_count = done
             live_results.append(latest)
+            # Remove the completed lead from in-flight
+            if latest.name in in_flight:
+                in_flight.remove(latest.name)
             progress.progress(
                 done / total_,
-                text=f"Enriched {done}/{total_}: {latest.name} → score {latest.score}",
+                text=f"✓ {latest.name} → score {latest.score} · {_render_progress_text()}",
             )
         elif kind == "done":
             st.session_state.results = msg[1]

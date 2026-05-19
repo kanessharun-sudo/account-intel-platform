@@ -10,12 +10,19 @@ internally, returning a final assistant message.
 
 NOTE: Tool version strings verified against docs.claude.com on
 2026-05-19. If Anthropic rotates versions, update TOOL_DEFINITIONS below.
+
+Reliability features (added 2026-05-19 based on production feedback):
+- Exponential backoff retry on 429 (rate limit) and 529 (overloaded)
+- One retry on JSON parse failure with a stricter reminder
+- Longer per-lead timeout (240s)
+- Per-lead 'started' progress events for better UI feedback
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import random
 import re
 from typing import Optional
 
@@ -45,6 +52,11 @@ TOOL_DEFINITIONS = [
 
 DEFAULT_MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 4096
+DEFAULT_TIMEOUT = 240.0  # bumped from 180s — some research loops take longer
+
+# Retry config for transient API failures (429 rate limit, 529 overloaded)
+MAX_API_RETRIES = 3
+BACKOFF_BASE_SECONDS = 5.0  # 5s, 15s, 30s with jitter
 
 
 def _extract_final_text(message) -> str:
@@ -93,12 +105,70 @@ def _extract_json_object(text: str) -> Optional[dict]:
     return None
 
 
+def _is_retryable_api_error(err: Exception) -> bool:
+    """Decide whether an APIError is worth retrying (rate limit / overload)."""
+    # The Anthropic SDK exposes status_code on APIError; fall back to text match
+    status = getattr(err, "status_code", None)
+    if status in (429, 529, 503, 502):
+        return True
+    msg = str(err).lower()
+    return any(x in msg for x in ("rate limit", "overload", "529", "429", "503"))
+
+
+async def _call_with_retries(
+    client: AsyncAnthropic,
+    *,
+    model: str,
+    system: str,
+    tools: list,
+    messages: list,
+    max_tokens: int,
+    timeout: float,
+) -> object:
+    """Call messages.create with exponential backoff on transient failures.
+
+    Returns the message on success; raises the last exception on final failure.
+    """
+    last_exc: Optional[Exception] = None
+    for attempt in range(MAX_API_RETRIES + 1):  # initial try + retries
+        try:
+            return await asyncio.wait_for(
+                client.messages.create(
+                    model=model,
+                    max_tokens=max_tokens,
+                    system=system,
+                    tools=tools,
+                    messages=messages,
+                ),
+                timeout=timeout,
+            )
+        except APIError as e:
+            last_exc = e
+            if not _is_retryable_api_error(e) or attempt == MAX_API_RETRIES:
+                raise
+            # Exponential backoff with jitter: 5s, 15s, 30s (+/- 20%)
+            wait = BACKOFF_BASE_SECONDS * (3 ** attempt)
+            wait *= 0.8 + random.random() * 0.4
+            log.warning(
+                "Retryable API error (attempt %d/%d), waiting %.1fs: %s",
+                attempt + 1, MAX_API_RETRIES, wait, e,
+            )
+            await asyncio.sleep(wait)
+        except asyncio.TimeoutError:
+            # Timeouts are not retryable here — they consume the whole budget
+            raise
+    # Unreachable, but satisfies the type checker
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("retry loop exited without result")
+
+
 async def enrich_lead(
     client: AsyncAnthropic,
     lead: Lead,
     icp_text: str,
     model: str = DEFAULT_MODEL,
-    timeout: float = 180.0,
+    timeout: float = DEFAULT_TIMEOUT,
 ) -> EnrichmentResult:
     """Run the agentic enrichment loop for a single lead.
 
@@ -106,19 +176,19 @@ async def enrich_lead(
     to implement the tool_use -> tool_result loop ourselves. Anthropic's
     infrastructure executes the searches and feeds results back to the
     model before returning the final response. From our side, this is a
-    single messages.create() call.
+    single messages.create() call (plus retries on transient failure).
     """
     user_msg = build_user_prompt(lead, icp_text)
 
+    # First attempt: full research + JSON output
     try:
-        message = await asyncio.wait_for(
-            client.messages.create(
-                model=model,
-                max_tokens=MAX_TOKENS,
-                system=SYSTEM_PROMPT,
-                tools=TOOL_DEFINITIONS,
-                messages=[{"role": "user", "content": user_msg}],
-            ),
+        message = await _call_with_retries(
+            client,
+            model=model,
+            system=SYSTEM_PROMPT,
+            tools=TOOL_DEFINITIONS,
+            messages=[{"role": "user", "content": user_msg}],
+            max_tokens=MAX_TOKENS,
             timeout=timeout,
         )
     except asyncio.TimeoutError:
@@ -133,10 +203,41 @@ async def enrich_lead(
     text = _extract_final_text(message)
     parsed = _extract_json_object(text)
 
+    # JSON parse retry: ask the model once more to output JSON only,
+    # passing back what it said so it can self-correct.
+    if not parsed:
+        log.info("First-pass JSON parse failed for %s, retrying once.", lead.name)
+        retry_user_msg = (
+            "Your previous response could not be parsed as JSON. "
+            "Re-emit your final answer as a SINGLE JSON object matching the "
+            "schema, with no surrounding prose, no markdown fences, no "
+            "commentary — just the JSON. "
+            f"\n\nOriginal request was:\n\n{user_msg}"
+        )
+        try:
+            # No tools on the retry — research is done, we just want the JSON
+            retry_msg = await _call_with_retries(
+                client,
+                model=model,
+                system=SYSTEM_PROMPT,
+                tools=[],
+                messages=[
+                    {"role": "user", "content": user_msg},
+                    {"role": "assistant", "content": text or "(no output)"},
+                    {"role": "user", "content": retry_user_msg},
+                ],
+                max_tokens=MAX_TOKENS,
+                timeout=60.0,  # no research, so much shorter
+            )
+            retry_text = _extract_final_text(retry_msg)
+            parsed = _extract_json_object(retry_text)
+        except Exception as e:
+            log.warning("JSON retry failed for %s: %s", lead.name, e)
+
     if not parsed:
         return _error_result(
             lead,
-            "Model did not return parseable JSON",
+            "Model did not return parseable JSON (after retry)",
             raw=text[:500] if text else None,
         )
 
@@ -181,32 +282,60 @@ async def enrich_leads(
     leads: list[Lead],
     icp_text: str,
     model: str = DEFAULT_MODEL,
-    concurrency: int = 4,
+    concurrency: int = 3,  # lowered default from 4 — gentler on rate limits
     progress_callback=None,
 ) -> list[EnrichmentResult]:
     """Enrich a batch of leads with bounded concurrency.
 
     progress_callback: optional callable invoked as
-        progress_callback(done_count, total, latest_result)
-    after each lead completes (in completion order, not input order).
+        progress_callback(event_type, done_count, total, payload)
+      where event_type is 'started' or 'completed', and payload is the
+      Lead (for 'started') or the EnrichmentResult (for 'completed').
+
+    Backwards compatibility: if progress_callback only accepts 3 args
+    (done, total, latest_result), we fall back to calling it that way
+    on 'completed' events only.
     """
     sem = asyncio.Semaphore(concurrency)
     total = len(leads)
     done = 0
+    started = 0
     results: list[Optional[EnrichmentResult]] = [None] * total
 
+    # Detect callback signature for backwards compatibility
+    cb_supports_events = False
+    if progress_callback is not None:
+        try:
+            import inspect
+            sig = inspect.signature(progress_callback)
+            cb_supports_events = len(sig.parameters) >= 4
+        except (TypeError, ValueError):
+            cb_supports_events = False
+
+    def _notify(event: str, payload):
+        nonlocal done, started
+        if not progress_callback:
+            return
+        try:
+            if cb_supports_events:
+                count = done if event == "completed" else started
+                progress_callback(event, count, total, payload)
+            else:
+                # Legacy 3-arg callback: only fire on completed
+                if event == "completed":
+                    progress_callback(done, total, payload)
+        except Exception:
+            log.exception("progress_callback raised")
+
     async def _run(idx: int, lead: Lead):
-        nonlocal done
+        nonlocal done, started
         async with sem:
+            started += 1
+            _notify("started", lead)
             res = await enrich_lead(client, lead, icp_text, model=model)
         results[idx] = res
         done += 1
-        if progress_callback:
-            try:
-                progress_callback(done, total, res)
-            except Exception:
-                log.exception("progress_callback raised")
+        _notify("completed", res)
 
     await asyncio.gather(*(_run(i, lead) for i, lead in enumerate(leads)))
-    # All slots are filled by gather completion
     return [r for r in results if r is not None]
