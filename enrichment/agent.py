@@ -52,11 +52,16 @@ TOOL_DEFINITIONS = [
 
 DEFAULT_MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 4096
-DEFAULT_TIMEOUT = 240.0  # bumped from 180s — some research loops take longer
+DEFAULT_TIMEOUT = 420.0  # 7 min — covers up to 2 long rate-limit waits + research
 
 # Retry config for transient API failures (429 rate limit, 529 overloaded)
 MAX_API_RETRIES = 3
-BACKOFF_BASE_SECONDS = 5.0  # 5s, 15s, 30s with jitter
+# Backoff schedules differ by error type:
+# - 429 rate-limit errors: the per-minute window is 60s, so retrying sooner
+#   just hits the same wall. Wait long enough for the window to reset.
+# - 529/503/502 (server-side overloads): exponential backoff is appropriate.
+RATE_LIMIT_BACKOFF_SECONDS = [65.0, 95.0, 125.0]  # ~1 min, ~1.5 min, ~2 min
+OVERLOAD_BACKOFF_SECONDS = [5.0, 15.0, 30.0]      # exponential
 
 
 def _extract_final_text(message) -> str:
@@ -115,6 +120,27 @@ def _is_retryable_api_error(err: Exception) -> bool:
     return any(x in msg for x in ("rate limit", "overload", "529", "429", "503"))
 
 
+def _is_rate_limit_error(err: Exception) -> bool:
+    """True for 429 rate-limit errors specifically (need long waits)."""
+    if getattr(err, "status_code", None) == 429:
+        return True
+    msg = str(err).lower()
+    return "429" in msg or "rate_limit_error" in msg or "rate limit" in msg
+
+
+def _backoff_for(err: Exception, attempt: int) -> float:
+    """Pick a wait duration in seconds given the error type and attempt index."""
+    schedule = (
+        RATE_LIMIT_BACKOFF_SECONDS
+        if _is_rate_limit_error(err)
+        else OVERLOAD_BACKOFF_SECONDS
+    )
+    idx = min(attempt, len(schedule) - 1)
+    base = schedule[idx]
+    # ±20% jitter so concurrent retries don't synchronize
+    return base * (0.8 + random.random() * 0.4)
+
+
 async def _call_with_retries(
     client: AsyncAnthropic,
     *,
@@ -125,8 +151,10 @@ async def _call_with_retries(
     max_tokens: int,
     timeout: float,
 ) -> object:
-    """Call messages.create with exponential backoff on transient failures.
+    """Call messages.create with backoff on transient failures.
 
+    Uses long waits (~60-120s) for 429 rate-limit errors since the per-minute
+    window must reset, and shorter exponential backoff for 5xx overloads.
     Returns the message on success; raises the last exception on final failure.
     """
     last_exc: Optional[Exception] = None
@@ -146,12 +174,12 @@ async def _call_with_retries(
             last_exc = e
             if not _is_retryable_api_error(e) or attempt == MAX_API_RETRIES:
                 raise
-            # Exponential backoff with jitter: 5s, 15s, 30s (+/- 20%)
-            wait = BACKOFF_BASE_SECONDS * (3 ** attempt)
-            wait *= 0.8 + random.random() * 0.4
+            wait = _backoff_for(e, attempt)
+            err_kind = "rate-limit" if _is_rate_limit_error(e) else "overload"
             log.warning(
-                "Retryable API error (attempt %d/%d), waiting %.1fs: %s",
-                attempt + 1, MAX_API_RETRIES, wait, e,
+                "Retryable %s error (attempt %d/%d), waiting %.1fs: %s",
+                err_kind, attempt + 1, MAX_API_RETRIES, wait,
+                str(e)[:200],
             )
             await asyncio.sleep(wait)
         except asyncio.TimeoutError:

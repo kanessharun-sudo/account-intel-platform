@@ -52,6 +52,20 @@ SYSTEM_PROMPT = dedent("""
     - medium: company well-understood, person partial or vice versa.
     - low: significant gaps; score is largely heuristic.
 
+    CRITICAL — the "error" field:
+    The "error" field is reserved for TRUE FAILURES where you cannot produce
+    a scored result at all. Examples of when to set "error":
+    - The company doesn't exist or you got zero usable information
+    - A tool returned an unrecoverable error
+    Do NOT use the "error" field for:
+    - "I couldn't verify the individual person" → this goes in justification,
+      and you lower confidence to "low" or "medium"
+    - "The company doesn't fit the ICP" → that's a valid low score, not an error
+    - "Sources were limited" → goes in justification, lower confidence
+    If you produced a score, summaries, and justification, then "error" MUST
+    be null. The presence of an "error" value means "this row could not be
+    enriched at all" — be strict about this.
+
     Output format:
     Your FINAL response (after all tool use is done) MUST be a single JSON
     object matching this exact schema and nothing else — no prose, no
