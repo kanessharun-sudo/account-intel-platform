@@ -36,17 +36,23 @@ log = logging.getLogger(__name__)
 # Server-side tools provided by Anthropic. The version suffixes are
 # capability-keyed (the 20260209 versions add dynamic filtering — Claude
 # post-processes results in a sandbox before they hit context).
+#
+# allowed_callers=["direct"] is REQUIRED for Haiku 4.5 (it doesn't support
+# programmatic tool calling) and harmless for Sonnet/Opus, so we set it
+# unconditionally for cross-model compatibility.
 TOOL_DEFINITIONS = [
     {
         "type": "web_search_20260209",
         "name": "web_search",
         "max_uses": 4,  # cap per request
+        "allowed_callers": ["direct"],
     },
     {
         "type": "web_fetch_20260209",
         "name": "web_fetch",
         "max_uses": 3,
         "citations": {"enabled": True},
+        "allowed_callers": ["direct"],
     },
 ]
 
